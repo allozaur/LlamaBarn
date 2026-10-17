@@ -44,17 +44,43 @@ enum LocalNetwork {
     return addresses.values.sorted().first
   }
 
-  /// Non-loopback IPv4 addresses, keyed by interface name. `TailscaleInterface`
-  /// picks its overlay address out of this.
+  /// Non-loopback IPv4 addresses, keyed by interface name, first address per
+  /// interface. `TailscaleInterface` picks its overlay address out of this.
   static func ipv4Addresses() -> [String: String] {
+    var result: [String: String] = [:]
+    forEachIPv4Address { interface, ip in
+      // First address wins per interface -- an interface can carry several
+      // aliases, and the first is the one macOS treats as primary for it.
+      if result[interface] == nil {
+        result[interface] = ip
+      }
+    }
+    return result
+  }
+
+  /// Every current non-loopback IPv4 address, on any interface, aliases
+  /// included -- the full set a `0.0.0.0`-bound server answers on, where
+  /// `ipv4Addresses()`'s one-address-per-interface shape isn't the whole of
+  /// it: a web app pinned to a secondary alias is still pinned to this
+  /// server.
+  static func allIPv4Addresses() -> Set<String> {
+    var addresses = Set<String>()
+    forEachIPv4Address { _, ip in addresses.insert(ip) }
+    return addresses
+  }
+
+  /// Walks the IPv4 address of every up, non-loopback interface entry, in
+  /// system order -- the shared walker behind `ipv4Addresses()` and
+  /// `allIPv4Addresses()`, so the two can't drift on what counts as a
+  /// current address. `body` gets the interface name and the numeric
+  /// address; empty addresses are skipped.
+  private static func forEachIPv4Address(_ body: (_ interface: String, _ address: String) -> Void) {
     var ifaddr: UnsafeMutablePointer<ifaddrs>?
 
     // Get linked list of all network interfaces (returns 0 on success)
-    guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return [:] }
+    guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return }
     // Ensure memory is freed when function exits
     defer { freeifaddrs(ifaddr) }
-
-    var result: [String: String] = [:]
 
     for ifptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
       let interface = ifptr.pointee
@@ -81,14 +107,10 @@ enum LocalNetwork {
         NI_NUMERICHOST  // Return numeric address (e.g., "192.168.1.5")
       )
 
-      // First address wins per interface -- an interface can carry several
-      // aliases, and the first is the one macOS treats as primary for it.
       let ip = String(cString: addr)
-      if result[name] == nil, !ip.isEmpty {
-        result[name] = ip
+      if !ip.isEmpty {
+        body(name, ip)
       }
     }
-
-    return result
   }
 }

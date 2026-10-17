@@ -161,16 +161,18 @@ class LlamaServer {
 
   /// The spellings of a bound address that a URL could carry. `127.0.0.1` is
   /// also reachable as `localhost`; `0.0.0.0` is every interface, so every
-  /// current address counts, plus the literal itself (`resolvedHost`'s
-  /// fallback when there is no IPv4 to resolve it to). The server binds
-  /// IPv4, so `::1` is deliberately absent -- folding it in would hand the
-  /// web app a link nothing answers on.
+  /// current address counts -- secondary aliases on an interface too
+  /// (`LocalNetwork.allIPv4Addresses()`: the server binds them all, so an
+  /// app pinned to one is pinned to this server) -- plus the literal itself
+  /// (`resolvedHost`'s fallback when there is no IPv4 to resolve it to). The
+  /// server binds IPv4, so `::1` is deliberately absent -- folding it in
+  /// would hand the web app a link nothing answers on.
   private static func hostSpellings(of address: String) -> Set<String> {
     if address == "127.0.0.1" || address == "localhost" { return loopbackHosts }
     if address == "0.0.0.0" {
       var all = loopbackHosts
       all.insert("0.0.0.0")
-      all.formUnion(LocalNetwork.ipv4Addresses().values.map { $0.lowercased() })
+      all.formUnion(LocalNetwork.allIPv4Addresses().map { $0.lowercased() })
       return all
     }
     return [address.lowercased()]
