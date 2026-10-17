@@ -180,6 +180,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // Gracefully stop the llama-server process when app quits
     LlamaServer.shared.stop()
+
+    // The web app is a separate process, and without the server it only shows
+    // connection errors -- so it quits with the app.
+    if let webUiURL = URL(string: "http://\(LlamaServer.resolvedHost):\(LlamaServer.port)/") {
+      SafariWebApp.quitRunningInstances(matching: webUiURL)
+    }
   }
 }
 
