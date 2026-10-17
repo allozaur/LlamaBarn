@@ -108,18 +108,16 @@ class ItemView: NSView {
   /// this server, otherwise falls back to the default browser.
   func openChat(_ url: URL) {
     if let app = SafariWebApp.installed(matching: url) {
-      launchWebApp(app)
+      // Async like `openInBrowser`: a cold template launch must not hold the
+      // main thread. A detected bundle isn't guaranteed launchable (a copy
+      // from another Mac reads as damaged; LaunchServices can refuse the
+      // registration), so the WebUI URL rides along and the browser takes
+      // over when the launch fails -- the click must still open something.
+      SafariWebApp.launch(app, fallbackURL: url)
+      dismissMenu()
       return
     }
     openInBrowser(url)
-  }
-
-  /// Launches an installed Safari Web App bundle and closes the menu. Async
-  /// like `openInBrowser`: a cold template launch must not hold the main
-  /// thread.
-  func launchWebApp(_ appURL: URL) {
-    NSWorkspace.shared.open(appURL, configuration: NSWorkspace.OpenConfiguration())
-    dismissMenu()
   }
 
   /// Opens `url` in the installed Safari Web App and closes the menu: the

@@ -112,48 +112,108 @@ enum SafariWebApp {
   /// app takes a URL other than its pinned start URL, so the webui reads the
   /// same query a browser visit would.
   ///
-  /// The delivery is split because a cold start swallows the event: it lands
-  /// during launch, before there is a webview to navigate, and the app stays
-  /// on its pinned start URL. Once the process is up and its page under way,
-  /// the same event navigates. An app that is already running gets the event
-  /// right away. The link is rehosted to the app's pinned origin first (a web
-  /// app navigates only within it); when that fails there is no way to
-  /// deliver, and `false` tells the caller to fall back to the browser.
+  /// The link is rehosted to the app's pinned origin first (a web app
+  /// navigates only within it); when that fails there is no way to deliver,
+  /// and `false` tells the caller to fall back to the browser. A delivery
+  /// LaunchServices refuses after the fact is covered here instead -- `open`
+  /// has already returned -- by opening the original URL in the browser: the
+  /// rehosted one targets the app's pinned origin, and that app just refused
+  /// the delivery.
   @discardableResult
   static func open(_ url: URL, inWebAppAt appURL: URL) -> Bool {
     guard let linkURL = rehosted(url, forWebAppAt: appURL) else { return false }
     let bundleID = bundleIdentifier(of: appURL)
-    let running = bundleID != nil && NSWorkspace.shared.runningApplications.contains {
-      $0.bundleIdentifier == bundleID
-    }
-
-    Task {
-      if !running {
-        NSWorkspace.shared.open(appURL, configuration: NSWorkspace.OpenConfiguration()) { _, error in
-          if let error {
-            logger.error("Launching web app: \(error.localizedDescription, privacy: .public)")
-          }
-        }
-        // Wait for the process, then for the page it opens to be under way.
-        if let bundleID {
-          var waited: UInt64 = 0
-          while waited < launchPollLimit,
-                !NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == bundleID })
-          {
-            try? await Task.sleep(nanoseconds: launchPollInterval)
-            waited += launchPollInterval
-          }
-        }
-        try? await Task.sleep(nanoseconds: pageSettleDelay)
-      }
+    enqueue(to: appURL) {
+      await ensureReady(appURL, bundleID: bundleID)
       NSWorkspace.shared.open(
-        [linkURL], withApplicationAt: appURL, configuration: NSWorkspace.OpenConfiguration()) { _, error in
-        if let error {
-          logger.error("Delivering link to web app: \(error.localizedDescription, privacy: .public)")
+        [linkURL], withApplicationAt: appURL, configuration: NSWorkspace.OpenConfiguration()
+      ) { _, error in
+        guard let error else { return }
+        logger.error("Delivering link to web app: \(error.localizedDescription, privacy: .public)")
+        Task { @MainActor in
+          NSWorkspace.shared.open(url, configuration: NSWorkspace.OpenConfiguration())
         }
       }
     }
     return true
+  }
+
+  /// Launches (or activates) the web app at `appURL`, opening `fallbackURL`
+  /// in the default browser when LaunchServices refuses the open -- a
+  /// matching plist doesn't guarantee a launchable bundle (a template bundle
+  /// copied from another Mac reads as damaged, and registration can be
+  /// rejected), and the click should still land somewhere rather than
+  /// nowhere.
+  static func launch(_ appURL: URL, fallbackURL: URL) {
+    let bundleID = bundleIdentifier(of: appURL)
+    // Through the chain, like a delivery: a cold start holds the app's chain
+    // until its first page is under way, so a click arriving meanwhile (Chat
+    // with model, a capture) waits for readiness instead of its event being
+    // swallowed.
+    enqueue(to: appURL) {
+      await ensureReady(appURL, bundleID: bundleID, launchFallbackURL: fallbackURL)
+    }
+  }
+
+  /// The request outstanding per installed app (keyed by bundle id, or the
+  /// bundle path when no plist id), each awaiting the previous: two clicks
+  /// in a row -- model A then B while the app is cold, or a capture during a
+  /// cold delivery -- resolve in the order the user made them. Unserialized,
+  /// the second sees the just-launched process, skips the readiness wait,
+  /// and delivers before the first, whose late delivery then navigates the
+  /// app away from the user's later choice.
+  private static var chains: [String: Task<Void, Never>] = [:]
+
+  /// Runs `body` once any earlier request for the same app has completed.
+  private static func enqueue(to appURL: URL, _ body: @escaping @MainActor () async -> Void) {
+    let key = bundleIdentifier(of: appURL) ?? appURL.path
+    let previous = chains[key]
+    chains[key] = Task {
+      await previous?.value
+      await body()
+    }
+  }
+
+  /// Brings the app up if it isn't running, and waits until a delivered
+  /// link can navigate: the process up (polled for at most
+  /// `launchPollLimit`), then its first page under way (`pageSettleDelay`).
+  /// Delivered during the launch, the event lands before there is a webview
+  /// to navigate and is swallowed -- which is why readiness is awaited
+  /// rather than trusted to the launch call. Already running, there is
+  /// nothing to wait for.
+  ///
+  /// `launchFallbackURL` is opened in the browser when the open itself is
+  /// refused. Nil on the delivery path, where the delivery's own failure
+  /// fallback covers it -- doing both would open two tabs.
+  private static func ensureReady(
+    _ appURL: URL, bundleID: String?, launchFallbackURL: URL? = nil
+  ) async {
+    let running = bundleID != nil && NSWorkspace.shared.runningApplications.contains {
+      $0.bundleIdentifier == bundleID
+    }
+    // Open launches a cold app and merely activates a running one -- both
+    // wanted here ("Open chat" on a running app is an activate), and for a
+    // delivery the activate is redundant with the delivery's own open, kept
+    // so there is one path.
+    NSWorkspace.shared.open(appURL, configuration: NSWorkspace.OpenConfiguration()) { _, error in
+      guard let error else { return }
+      logger.error("Launching web app: \(error.localizedDescription, privacy: .public)")
+      guard let launchFallbackURL else { return }
+      Task { @MainActor in
+        NSWorkspace.shared.open(launchFallbackURL, configuration: NSWorkspace.OpenConfiguration())
+      }
+    }
+    guard !running else { return }
+    if let bundleID {
+      var waited: UInt64 = 0
+      while waited < launchPollLimit,
+            !NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == bundleID })
+      {
+        try? await Task.sleep(nanoseconds: launchPollInterval)
+        waited += launchPollInterval
+      }
+    }
+    try? await Task.sleep(nanoseconds: pageSettleDelay)
   }
 
   /// Cold-start delivery tuning: the open-URL event has to land after the
@@ -194,7 +254,7 @@ enum SafariWebApp {
   /// `@MainActor` (its `init` was nonisolated while the `LlamaServer` fact it
   /// reads is main-actor-isolated, which the first full build caught).
   @MainActor
-  private struct Origin: Equatable {
+  private struct Origin: @MainActor Equatable {
     let scheme: String
     let port: Int
     /// The host as written, lowercased -- compared only when neither side is
