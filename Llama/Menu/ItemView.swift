@@ -104,6 +104,71 @@ class ItemView: NSView {
     dismissMenu()
   }
 
+  /// Opens the WebUI as a Safari Web App when the user has installed one for
+  /// this server, otherwise falls back to the default browser.
+  func openChat(_ url: URL) {
+    if let app = SafariWebApp.installed(matching: url) {
+      openWebApp(app)
+      return
+    }
+    openInBrowser(url)
+  }
+
+  /// Opens an installed Safari Web App bundle and closes the menu. Async like
+  /// `openInBrowser`: a cold template launch must not hold the main thread.
+  func openWebApp(_ appURL: URL) {
+    NSWorkspace.shared.open(appURL, configuration: NSWorkspace.OpenConfiguration())
+    dismissMenu()
+  }
+
+  /// Opens `url` in the installed Safari Web App: the link is delivered as an
+  /// open-URL event, which the app's host turns into webview navigation --
+  /// the one way a web app takes a URL other than its pinned start URL, so
+  /// the webui reads the same query a browser visit would.
+  func openInWebApp(_ url: URL, app: URL) {
+    // The web app lives on the same-machine host (what installs pin, and
+    // what the server always answers on); the LAN address the menu shows
+    // would be a different origin to navigate to.
+    var link = URLComponents(url: url, resolvingAgainstBaseURL: false)
+    link?.host = LlamaServer.localHost
+    guard let linkURL = link?.url else {
+      openInBrowser(url)
+      return
+    }
+    Self.navigateWebApp(to: linkURL, app: app, bundleID: SafariWebApp.bundleIdentifier(of: app))
+    dismissMenu()
+  }
+
+  /// Gets the web app showing `url` -- launching (or activating) it first,
+  /// then delivering the link.
+  ///
+  /// The delivery is split because a cold start swallows the event: it lands
+  /// during launch, before there is a webview to navigate, and the app stays
+  /// on its pinned start URL. Once the process is up and its page under way,
+  /// the same event navigates. An app that is already running gets the event
+  /// right away.
+  private static func navigateWebApp(to url: URL, app: URL, bundleID: String?) {
+    let running = bundleID != nil && NSWorkspace.shared.runningApplications.contains {
+      $0.bundleIdentifier == bundleID
+    }
+
+    Task {
+      if !running {
+        NSWorkspace.shared.open(app, configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
+        // Wait for the process, then for the page it opens to be under way.
+        if let bundleID {
+          for _ in 0..<20 where !NSWorkspace.shared.runningApplications.contains(
+            where: { $0.bundleIdentifier == bundleID }) {
+            try? await Task.sleep(nanoseconds: 250_000_000)
+          }
+        }
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+      }
+      NSWorkspace.shared.open(
+        [url], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
+    }
+  }
+
   /// Dismisses the enclosing menu. Our menu items are disabled so clicks don't
   /// auto-close the menu (see the class note), which means a handler that
   /// navigates away has to close the menu itself. Without this the menu lingers;
