@@ -126,12 +126,9 @@ class ItemView: NSView {
   /// the one way a web app takes a URL other than its pinned start URL, so
   /// the webui reads the same query a browser visit would.
   func openInWebApp(_ url: URL, app: URL) {
-    // The web app lives on the same-machine host (what installs pin, and
-    // what the server always answers on); the LAN address the menu shows
-    // would be a different origin to navigate to.
-    var link = URLComponents(url: url, resolvingAgainstBaseURL: false)
-    link?.host = LlamaServer.localHost
-    guard let linkURL = link?.url else {
+    // On the app's own origin: a link it doesn't cover opens in the browser
+    // rather than in the app.
+    guard let linkURL = SafariWebApp.rehosted(url, forWebAppAt: app) else {
       openInBrowser(url)
       return
     }

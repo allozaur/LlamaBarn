@@ -77,6 +77,29 @@ enum SafariWebApp {
     NSDictionary(contentsOf: appURL.appendingPathComponent("Contents/Info.plist"))?["CFBundleIdentifier"] as? String
   }
 
+  /// `url` re-addressed to the origin `appURL` is pinned to.
+  ///
+  /// A web app navigates only within its own origin; a URL outside it is
+  /// handed to the default browser instead. A link meant for the app
+  /// therefore has to arrive on the origin the app was installed from --
+  /// `localhost` or the LAN address, whichever the user added it from --
+  /// which only the bundle knows.
+  static func rehosted(_ url: URL, forWebAppAt appURL: URL) -> URL? {
+    guard
+      let info = NSDictionary(contentsOf: appURL.appendingPathComponent("Contents/Info.plist")),
+      let manifest = info["Manifest"] as? [String: Any],
+      let startURLString = manifest["start_url"] as? String,
+      let pinned = URLComponents(string: startURLString),
+      let host = pinned.host,
+      var link = URLComponents(url: url, resolvingAgainstBaseURL: false)
+    else { return nil }
+
+    link.scheme = pinned.scheme ?? link.scheme
+    link.host = host
+    link.port = pinned.port
+    return link.url
+  }
+
   /// Quits the running instances of every web app installed for `url`'s
   /// origin, for when the app goes away: a web app without its server is a
   /// window of connection errors. `terminate()` is a quit request rather than
