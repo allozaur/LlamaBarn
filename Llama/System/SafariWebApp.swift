@@ -189,6 +189,11 @@ enum SafariWebApp {
   /// moment it doesn't (an app pinned to an address the server doesn't serve
   /// is left alone -- its window would be connection errors; the browser
   /// still works). Hosts compare case-insensitively per RFC 3986.
+  ///
+  /// Explicitly isolated: a nested type doesn't inherit the enclosing enum's
+  /// `@MainActor` (its `init` was nonisolated while the `LlamaServer` fact it
+  /// reads is main-actor-isolated, which the first full build caught).
+  @MainActor
   private struct Origin: Equatable {
     let scheme: String
     let port: Int
