@@ -679,7 +679,15 @@ final class MenuController: NSObject, NSMenuDelegate {
       chatRow.onAction = { [weak chatRow] in
         // Opened through the row so the menu dismisses with the navigation.
         guard let url = LlamaServer.webuiUrl(modelId: model.id) else { return }
-        chatRow?.openInBrowser(url)
+        // The web app gets the deep link itself: delivered as an open-URL
+        // event, its host navigates to it, so the webui reads the same
+        // `?model=` query the browser would -- selection and load progress
+        // included. Without a web app, the link goes to the browser.
+        if let app = SafariWebApp.installed(forOriginOf: url) {
+          chatRow?.openInWebApp(url, app: app)
+        } else {
+          chatRow?.openChat(url)
+        }
       }
       menu.addItem(NSMenuItem.viewItem(with: chatRow))
     }
