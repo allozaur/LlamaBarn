@@ -27,14 +27,21 @@ enum SafariWebApp {
   ]
 
   /// The installed web app pinned to `url`'s origin, if any.
+  static func installed(matching url: URL) -> URL? {
+    installedApps(matching: url).first
+  }
+
+  /// Every installed web app pinned to `url`'s origin -- one per install, so
+  /// a user can have several (two names, two Dock icons).
   ///
   /// URLs with a query never match: a plain launch always opens the pinned
   /// `start_url`, so a deep link like `?model=...` needs the open-URL
   /// delivery (`openInWebApp`) or the browser.
-  static func installed(matching url: URL) -> URL? {
+  static func installedApps(matching url: URL) -> [URL] {
     guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-          components.queryItems == nil else { return nil }
+          components.queryItems == nil else { return [] }
     let origin = Self.origin(of: components)
+    var matches: [URL] = []
 
     for directory in searchDirectories {
       let contents = (try? FileManager.default.contentsOfDirectory(
@@ -47,10 +54,10 @@ enum SafariWebApp {
               let manifest = info["Manifest"] as? [String: Any],
               let startURLString = manifest["start_url"] as? String,
               let start = URLComponents(string: startURLString) else { continue }
-        if Self.origin(of: start) == origin { return appURL }
+        if Self.origin(of: start) == origin { matches.append(appURL) }
       }
     }
-    return nil
+    return matches
   }
 
   /// `installed(matching:)` on `url`'s origin alone -- for callers whose deep
@@ -68,6 +75,19 @@ enum SafariWebApp {
   /// The web app's bundle identifier, for finding its running instance.
   static func bundleIdentifier(of appURL: URL) -> String? {
     NSDictionary(contentsOf: appURL.appendingPathComponent("Contents/Info.plist"))?["CFBundleIdentifier"] as? String
+  }
+
+  /// Quits the running instances of every web app installed for `url`'s
+  /// origin, for when the app goes away: a web app without its server is a
+  /// window of connection errors. `terminate()` is a quit request rather than
+  /// a kill -- the web app takes a few seconds and saves its state on the way
+  /// out, and it quits whether or not the requester is still around.
+  static func quitRunningInstances(matching url: URL) {
+    let bundleIDs = Set(installedApps(matching: url).compactMap(bundleIdentifier(of:)))
+    for app in NSWorkspace.shared.runningApplications {
+      guard let bundleID = app.bundleIdentifier, bundleIDs.contains(bundleID) else { continue }
+      app.terminate()
+    }
   }
 
   /// The scheme://host:port identity of a URL, with every host that names
