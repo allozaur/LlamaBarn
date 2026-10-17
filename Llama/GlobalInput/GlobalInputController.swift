@@ -193,12 +193,7 @@ final class GlobalInputController {
     // the WebUI by URL rather than going through LlamaServer.loadModel.
     UserSettings.lastUsedModelId = model.id
 
-    let host = LlamaServer.resolvedHost
-    var components = URLComponents()
-    components.scheme = "http"
-    components.host = host
-    components.port = LlamaServer.port
-    components.path = "/"
+    var components = LlamaServer.webuiComponents()
     // Always pass a concrete `?model=`. Handing the WebUI `?q=` with no model is
     // a dead path: its auto-send has no "pick a model first" fallback, so it
     // either 400s or spins on "Loading models…" forever.
@@ -213,6 +208,13 @@ final class GlobalInputController {
     }
 
     logger.info("Dispatching captured prompt to \(url.absoluteString, privacy: .public)")
+    // The installed web app when there is one -- the same destination the
+    // menu's chat rows pick -- and the default browser otherwise. Either way
+    // the query travels whole: the webui reads `?q=`/`?model=` from the web
+    // app's open-URL delivery exactly as it would from a browser visit.
+    if let app = SafariWebApp.installed(forOriginOf: url), SafariWebApp.open(url, inWebAppAt: app) {
+      return
+    }
     NSWorkspace.shared.open(url)
   }
 
