@@ -126,13 +126,79 @@ class LlamaServer {
   ///
   /// Unlike `resolvedHost` (which produces a URL for *other* devices), this is
   /// about reachability from this machine. With a specific address configured,
-  /// loopback is only bound too when the engine is new enough (`hostArgument`),
-  /// but the specific address is bound either way -- so the app talks to that,
-  /// which keeps this independent of the engine version. `0.0.0.0` already
-  /// includes loopback, so localhost stays the cheapest way in.
+  /// loopback is only bound too when the engine is new enough
+  /// (`boundAddresses`), but the specific address is bound either way -- so
+  /// the app talks to that, which keeps this independent of the engine
+  /// version. `0.0.0.0` already includes loopback, so localhost stays the
+  /// cheapest way in.
   nonisolated static var localHost: String {
     guard let bindAddr = effectiveBindAddress, bindAddr != "0.0.0.0" else { return "localhost" }
     return bindAddr
+  }
+
+  /// Every host spelling a URL can carry and still reach the running server.
+  ///
+  /// The menu and the capture panel build their URLs from `resolvedHost`,
+  /// while a web app stays pinned to whatever spelling the user installed it
+  /// from -- `SafariWebApp` matches the two by folding spellings from this set
+  /// together, and the bind is what decides whether two spellings are the
+  /// same server: `localhost` and the LAN address fold while exposure is on
+  /// (the server answers on both) and stop folding the moment it's off (a web
+  /// app pinned to the LAN address would otherwise be opened into a window
+  /// of connection errors).
+  ///
+  /// Reads settings, the resolved binary's version and the current
+  /// interfaces, so every caller gets a fresh answer.
+  static var reachableHosts: Set<String> {
+    // No configured bind: `llama serve` binds loopback by default.
+    guard let bindAddress = effectiveBindAddress else { return loopbackHosts }
+    var hosts = Set<String>()
+    for address in boundAddresses(for: bindAddress) {
+      hosts.formUnion(hostSpellings(of: address))
+    }
+    return hosts
+  }
+
+  /// The spellings of a bound address that a URL could carry. `127.0.0.1` is
+  /// also reachable as `localhost`; `0.0.0.0` is every interface, so every
+  /// current address counts, plus the literal itself (`resolvedHost`'s
+  /// fallback when there is no IPv4 to resolve it to). The server binds
+  /// IPv4, so `::1` is deliberately absent -- folding it in would hand the
+  /// web app a link nothing answers on.
+  private static func hostSpellings(of address: String) -> Set<String> {
+    if address == "127.0.0.1" || address == "localhost" { return loopbackHosts }
+    if address == "0.0.0.0" {
+      var all = loopbackHosts
+      all.insert("0.0.0.0")
+      all.formUnion(LocalNetwork.ipv4Addresses().values.map { $0.lowercased() })
+      return all
+    }
+    return [address.lowercased()]
+  }
+
+  /// The loopback spellings that reach a loopback-bound server. Hosts
+  /// compare lowercased throughout (RFC 3986).
+  private static let loopbackHosts: Set<String> = ["localhost", "127.0.0.1"]
+
+  /// Components for the WebUI's origin: every WebUI URL the app builds --
+  /// the model deep link, quit-at-exit's origin match, the capture panel's
+  /// dispatched prompt -- starts here, built with `URLComponents` so an IPv6
+  /// bind literal is bracketed rather than ending up as an unparseable
+  /// `http://::1:9931/` string.
+  static func webuiComponents() -> URLComponents {
+    var components = URLComponents()
+    components.scheme = "http"
+    components.host = resolvedHost
+    components.port = port
+    components.path = "/"
+    return components
+  }
+
+  /// The WebUI's origin URL, without a query -- what quit-at-exit matches
+  /// installed web apps against, the same origin the menu's "Open chat"
+  /// links with.
+  static func webuiUrl() -> URL? {
+    webuiComponents().url
   }
 
   /// Webui URL with the given model preselected via the `?model=` query param
@@ -144,11 +210,7 @@ class LlamaServer {
   /// page that looks idle until you send something. Landed in engine b10318;
   /// older builds ignore the unknown param, so passing it is safe below the pin.
   static func webuiUrl(modelId: String) -> URL? {
-    var components = URLComponents()
-    components.scheme = "http"
-    components.host = resolvedHost
-    components.port = port
-    components.path = "/"
+    var components = webuiComponents()
     components.queryItems = [
       URLQueryItem(name: "model", value: modelId),
       URLQueryItem(name: "load", value: "true"),
@@ -402,7 +464,10 @@ class LlamaServer {
     .urls(for: .libraryDirectory, in: .userDomainMask)[0]
     .appendingPathComponent("Logs/Llama/llama-server.log").path
 
-  /// The `--host` value for a network bind address.
+  /// The addresses the server binds for a network bind address. Shared by
+  /// the `--host` argument (which renders them comma-joined) and
+  /// `reachableHosts` (which reads them as the spellings that reach the
+  /// server).
   ///
   /// `llama serve` listens only on the addresses it's given, so binding a
   /// specific one (Tailscale, or a hand-set IP) would otherwise take loopback
@@ -414,12 +479,17 @@ class LlamaServer {
   /// Only engines from `multiHostVersion` on accept a list; older ones (and an
   /// unreadable version) get the single address, as before. `0.0.0.0` already
   /// covers loopback, and repeating `127.0.0.1` would fail the second bind.
-  private static func hostArgument(for bindAddress: String) -> String {
+  private static func boundAddresses(for bindAddress: String) -> [String] {
     guard bindAddress != "0.0.0.0", bindAddress != "127.0.0.1",
-      let version = LlamaInstallManager.shared.currentVersion,
-      version >= LlamaBinaries.multiHostVersion
-    else { return bindAddress }
-    return "127.0.0.1,\(bindAddress)"
+          let version = LlamaInstallManager.shared.currentVersion,
+          version >= LlamaBinaries.multiHostVersion
+    else { return [bindAddress] }
+    return ["127.0.0.1", bindAddress]
+  }
+
+  /// The `--host` value for a network bind address.
+  private static func hostArgument(for bindAddress: String) -> String {
+    boundAddresses(for: bindAddress).joined(separator: ",")
   }
 
   /// Builds the `llama serve` launch spec from the current settings. Pure with

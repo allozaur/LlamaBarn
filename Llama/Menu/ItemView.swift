@@ -108,62 +108,32 @@ class ItemView: NSView {
   /// this server, otherwise falls back to the default browser.
   func openChat(_ url: URL) {
     if let app = SafariWebApp.installed(matching: url) {
-      openWebApp(app)
+      launchWebApp(app)
       return
     }
     openInBrowser(url)
   }
 
-  /// Opens an installed Safari Web App bundle and closes the menu. Async like
-  /// `openInBrowser`: a cold template launch must not hold the main thread.
-  func openWebApp(_ appURL: URL) {
+  /// Launches an installed Safari Web App bundle and closes the menu. Async
+  /// like `openInBrowser`: a cold template launch must not hold the main
+  /// thread.
+  func launchWebApp(_ appURL: URL) {
     NSWorkspace.shared.open(appURL, configuration: NSWorkspace.OpenConfiguration())
     dismissMenu()
   }
 
-  /// Opens `url` in the installed Safari Web App: the link is delivered as an
-  /// open-URL event, which the app's host turns into webview navigation --
-  /// the one way a web app takes a URL other than its pinned start URL, so
-  /// the webui reads the same query a browser visit would.
+  /// Opens `url` in the installed Safari Web App and closes the menu: the
+  /// link is delivered as an open-URL event, which the app's host turns into
+  /// webview navigation -- the one way a web app takes a URL other than its
+  /// pinned start URL, so the webui reads the same query a browser visit
+  /// would. Falls back to the browser when the link can't be delivered (see
+  /// `SafariWebApp.open`).
   func openInWebApp(_ url: URL, app: URL) {
-    // On the app's own origin: a link it doesn't cover opens in the browser
-    // rather than in the app.
-    guard let linkURL = SafariWebApp.rehosted(url, forWebAppAt: app) else {
+    guard SafariWebApp.open(url, inWebAppAt: app) else {
       openInBrowser(url)
       return
     }
-    Self.navigateWebApp(to: linkURL, app: app, bundleID: SafariWebApp.bundleIdentifier(of: app))
     dismissMenu()
-  }
-
-  /// Gets the web app showing `url` -- launching (or activating) it first,
-  /// then delivering the link.
-  ///
-  /// The delivery is split because a cold start swallows the event: it lands
-  /// during launch, before there is a webview to navigate, and the app stays
-  /// on its pinned start URL. Once the process is up and its page under way,
-  /// the same event navigates. An app that is already running gets the event
-  /// right away.
-  private static func navigateWebApp(to url: URL, app: URL, bundleID: String?) {
-    let running = bundleID != nil && NSWorkspace.shared.runningApplications.contains {
-      $0.bundleIdentifier == bundleID
-    }
-
-    Task {
-      if !running {
-        NSWorkspace.shared.open(app, configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
-        // Wait for the process, then for the page it opens to be under way.
-        if let bundleID {
-          for _ in 0..<20 where !NSWorkspace.shared.runningApplications.contains(
-            where: { $0.bundleIdentifier == bundleID }) {
-            try? await Task.sleep(nanoseconds: 250_000_000)
-          }
-        }
-        try? await Task.sleep(nanoseconds: 2_000_000_000)
-      }
-      NSWorkspace.shared.open(
-        [url], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
-    }
   }
 
   /// Dismisses the enclosing menu. Our menu items are disabled so clicks don't

@@ -682,11 +682,13 @@ final class MenuController: NSObject, NSMenuDelegate {
         // The web app gets the deep link itself: delivered as an open-URL
         // event, its host navigates to it, so the webui reads the same
         // `?model=` query the browser would -- selection and load progress
-        // included. Without a web app, the link goes to the browser.
+        // included. Without a web app, the link goes to the browser whole
+        // (not `openChat`: matching refuses query URLs, so it could only
+        // reach the same browser anyway).
         if let app = SafariWebApp.installed(forOriginOf: url) {
           chatRow?.openInWebApp(url, app: app)
         } else {
-          chatRow?.openChat(url)
+          chatRow?.openInBrowser(url)
         }
       }
       menu.addItem(NSMenuItem.viewItem(with: chatRow))

@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import os.log
 
 /// A Safari Web App ("Add to Dock", Safari 17+) installed for the WebUI.
 ///
@@ -13,7 +14,10 @@ import Foundation
 /// solely when Safari created them (it validates each one's signature against
 /// a registry in a Safari-only data vault), and the install itself is a user
 /// gesture in Safari.
+@MainActor
 enum SafariWebApp {
+
+  private nonisolated static let logger = Logger(subsystem: Logging.subsystem, category: "SafariWebApp")
 
   /// The prefix Safari stamps on every web app's bundle identifier; the UUID
   /// that follows is per-install.
@@ -40,7 +44,7 @@ enum SafariWebApp {
   static func installedApps(matching url: URL) -> [URL] {
     guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
           components.queryItems == nil else { return [] }
-    let origin = Self.origin(of: components)
+    let origin = Origin(components)
     var matches: [URL] = []
 
     for directory in searchDirectories {
@@ -48,13 +52,16 @@ enum SafariWebApp {
         at: directory, includingPropertiesForKeys: nil)) ?? []
       for appURL in contents.sorted(by: { $0.lastPathComponent < $1.lastPathComponent })
       where appURL.pathExtension == "app" {
+        // `Manifest`/`start_url` are Safari's own plist keys -- undocumented
+        // (reverse-engineered, verified against Safari 17+), so a format
+        // change on some future OS degrades to "no match" and the browser.
         guard let info = NSDictionary(contentsOf: appURL.appendingPathComponent("Contents/Info.plist")),
               let bundleID = info["CFBundleIdentifier"] as? String,
               bundleID.hasPrefix(bundleIDPrefix),
               let manifest = info["Manifest"] as? [String: Any],
               let startURLString = manifest["start_url"] as? String,
               let start = URLComponents(string: startURLString) else { continue }
-        if Self.origin(of: start) == origin { matches.append(appURL) }
+        if Origin(start) == origin { matches.append(appURL) }
       }
     }
     return matches
@@ -100,6 +107,64 @@ enum SafariWebApp {
     return link.url
   }
 
+  /// Shows `url` in the web app at `appURL` -- launching (or activating) it
+  /// first, then delivering the link as an open-URL event, the one way a web
+  /// app takes a URL other than its pinned start URL, so the webui reads the
+  /// same query a browser visit would.
+  ///
+  /// The delivery is split because a cold start swallows the event: it lands
+  /// during launch, before there is a webview to navigate, and the app stays
+  /// on its pinned start URL. Once the process is up and its page under way,
+  /// the same event navigates. An app that is already running gets the event
+  /// right away. The link is rehosted to the app's pinned origin first (a web
+  /// app navigates only within it); when that fails there is no way to
+  /// deliver, and `false` tells the caller to fall back to the browser.
+  @discardableResult
+  static func open(_ url: URL, inWebAppAt appURL: URL) -> Bool {
+    guard let linkURL = rehosted(url, forWebAppAt: appURL) else { return false }
+    let bundleID = bundleIdentifier(of: appURL)
+    let running = bundleID != nil && NSWorkspace.shared.runningApplications.contains {
+      $0.bundleIdentifier == bundleID
+    }
+
+    Task {
+      if !running {
+        NSWorkspace.shared.open(appURL, configuration: NSWorkspace.OpenConfiguration()) { _, error in
+          if let error {
+            logger.error("Launching web app: \(error.localizedDescription, privacy: .public)")
+          }
+        }
+        // Wait for the process, then for the page it opens to be under way.
+        if let bundleID {
+          var waited: UInt64 = 0
+          while waited < launchPollLimit,
+                !NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == bundleID })
+          {
+            try? await Task.sleep(nanoseconds: launchPollInterval)
+            waited += launchPollInterval
+          }
+        }
+        try? await Task.sleep(nanoseconds: pageSettleDelay)
+      }
+      NSWorkspace.shared.open(
+        [linkURL], withApplicationAt: appURL, configuration: NSWorkspace.OpenConfiguration()) { _, error in
+        if let error {
+          logger.error("Delivering link to web app: \(error.localizedDescription, privacy: .public)")
+        }
+      }
+    }
+    return true
+  }
+
+  /// Cold-start delivery tuning: the open-URL event has to land after the
+  /// launch, once the process is up (poll for it at most `launchPollLimit`)
+  /// and its first page under way (`pageSettleDelay`) -- sent during the
+  /// launch it lands before there is a webview to navigate, and the app stays
+  /// on its start URL.
+  private static let launchPollInterval: UInt64 = 250_000_000  // 0.25 s
+  private static let launchPollLimit: UInt64 = 5_000_000_000  // 5 s
+  private static let pageSettleDelay: UInt64 = 2_000_000_000  // 2 s
+
   /// Quits the running instances of every web app installed for `url`'s
   /// origin, for when the app goes away: a web app without its server is a
   /// window of connection errors. `terminate()` is a quit request rather than
@@ -113,18 +178,36 @@ enum SafariWebApp {
     }
   }
 
-  /// The scheme://host:port identity of a URL, with every host that names
-  /// this machine folded together: `localhost`, its loopback spellings, and
-  /// its current LAN address. The menu builds its URL from the LAN IP while a
-  /// web app installed from a `localhost` URL keeps that spelling, and both
-  /// name the same server. Hosts compare case-insensitively per RFC 3986.
-  private static func origin(of components: URLComponents) -> String {
-    let scheme = components.scheme ?? "http"
-    let port = components.port ?? (scheme == "https" ? 443 : 80)
-    let host = (components.host ?? "").lowercased()
-    let local = host == "localhost" || host == "127.0.0.1"
-      || host == "::1" || host == "[::1]"
-      || host == LocalNetwork.ipAddress()?.lowercased()
-    return "\(scheme)://\(local ? "localhost" : host):\(port)"
+  /// The scheme://host:port identity of a URL, for matching a web app's
+  /// pinned origin against the URL a caller hands in. Hosts that reach the
+  /// running server (`LlamaServer.reachableHosts`) all name the same server,
+  /// so they compare equal to each other and only to each other -- the menu
+  /// builds its URLs from the resolved host while a web app stays pinned to
+  /// whatever spelling the user installed it from, and the bind is what
+  /// decides whether two spellings are the same server: `localhost` and the
+  /// LAN address fold while the server answers on both, and stop folding the
+  /// moment it doesn't (an app pinned to an address the server doesn't serve
+  /// is left alone -- its window would be connection errors; the browser
+  /// still works). Hosts compare case-insensitively per RFC 3986.
+  private struct Origin: Equatable {
+    let scheme: String
+    let port: Int
+    /// The host as written, lowercased -- compared only when neither side is
+    /// `local`, so two hosts outside the reachable set match only by name.
+    let host: String
+    /// Whether the host reaches the running server right now.
+    let local: Bool
+
+    init(_ components: URLComponents) {
+      scheme = components.scheme ?? "http"
+      port = components.port ?? (scheme == "https" ? 443 : 80)
+      host = (components.host ?? "").lowercased()
+      local = LlamaServer.reachableHosts.contains(host)
+    }
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+      lhs.scheme == rhs.scheme && lhs.port == rhs.port
+        && ((lhs.local && rhs.local) || lhs.host == rhs.host)
+    }
   }
 }

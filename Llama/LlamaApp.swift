@@ -182,8 +182,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     LlamaServer.shared.stop()
 
     // The web app is a separate process, and without the server it only shows
-    // connection errors -- so it quits with the app.
-    if let webUiURL = URL(string: "http://\(LlamaServer.resolvedHost):\(LlamaServer.port)/") {
+    // connection errors -- so it quits with the app. `webuiUrl()` is the same
+    // origin the menu links with, so the apps quit are exactly the ones the
+    // menu would open.
+    if let webUiURL = LlamaServer.webuiUrl() {
       SafariWebApp.quitRunningInstances(matching: webUiURL)
     }
   }
