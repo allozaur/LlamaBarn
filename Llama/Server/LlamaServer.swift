@@ -403,12 +403,6 @@ class LlamaServer {
     }
   }
 
-  /// An empty dir pointed at by `LLAMA_CACHE` to suppress router mode's
-  /// automatic model discovery. Without it, llama-server scans the cache and
-  /// lists every GGUF it finds; we manage the model list ourselves via
-  /// `--models-preset`. A fixed `/tmp` path keeps the rendered command short.
-  nonisolated static let emptyCachePath = "/tmp/llama-empty-cache"
-
   /// Where the server writes its log (`--log-file`). `~/Library/Logs/<App>` is
   /// the macOS convention for app logs, and Console.app lists `.log` files there
   /// under Log Reports, so users can find it without the Settings button. Named
@@ -460,9 +454,9 @@ class LlamaServer {
 
     var env = [
       (key: "GGML_METAL_NO_RESIDENCY", value: "1"),
-      // Set HF_HUB_CACHE so llama-server can resolve model paths in preset
+      // The cache llama-server downloads models into, and resolves preset
+      // model paths against.
       (key: "HF_HUB_CACHE", value: UserSettings.hfCacheDirectory.path),
-      (key: "LLAMA_CACHE", value: Self.emptyCachePath),
     ]
 
     // Work around ggml-org/llama.cpp#31272: since b11923 the Metal unary
@@ -517,6 +511,11 @@ class LlamaServer {
     // Bare toggles (no value) last, so they don't split the value flags above.
     // No --jinja: it's been the server default since b7353, below the floor.
     arguments.append("--spec-default")
+
+    // Router mode lists every model in the HF cache, not just the ones in
+    // models.ini, so the web UI would show models the app's own UI doesn't.
+    // This keeps the list to the preset; downloads still go to the cache.
+    arguments.append("--no-models-cache")
 
     // Agent mode: enables the server's built-in tools and the UI's CORS/MCP
     // proxy. Opt-in via Settings; off by default because it lets models act
@@ -665,9 +664,6 @@ class LlamaServer {
       return
     }
 
-    // Ensure the empty-cache dir referenced by LLAMA_CACHE exists.
-    try? FileManager.default.createDirectory(
-      atPath: Self.emptyCachePath, withIntermediateDirectories: true)
     // llama.cpp opens `--log-file` with `fopen`, which won't create missing
     // folders -- without this the server runs but silently writes no log.
     try? FileManager.default.createDirectory(
@@ -685,6 +681,11 @@ class LlamaServer {
 
     var environment = ProcessInfo.processInfo.environment
     for (key, value) in spec.env { environment[key] = value }
+    // The server downloads models, so it needs the user's token for gated
+    // ones. Kept out of `spec.env`, which Settings renders as the command.
+    if let token = HFAuth.currentToken {
+      environment["HF_TOKEN"] = token
+    }
     process.environment = environment
 
     process.standardOutput = Pipe()

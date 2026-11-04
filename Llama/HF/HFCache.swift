@@ -1,6 +1,4 @@
-import CryptoKit
 import Foundation
-import os.log
 
 /// Utility for working with the standard HuggingFace Hub cache layout.
 ///
@@ -18,11 +16,11 @@ import os.log
 /// ```
 enum HFCache {
 
-  private static let logger = Logger(subsystem: Logging.subsystem, category: "HFCache")
-
-  /// Name of the hidden dir under the HF cache that holds in-progress `.partial`
-  /// files. Tied to the app's "llama" identity; `RenameMigration` moves the
-  /// pre-rename `.llamabarn-partial` dir here on first launch.
+  /// Name of the hidden dir under the HF cache that holds a placeholder per
+  /// unfinished download (and the `.partial` files of downloads earlier
+  /// versions ran themselves). Tied to the app's "llama" identity;
+  /// `RenameMigration` moves the pre-rename `.llamabarn-partial` dir here on
+  /// first launch.
   static let partialRootDirName = ".llama-partial"
 
   // MARK: - Path Helpers (pure, no I/O)
@@ -41,43 +39,11 @@ enum HFCache {
     return "models--\(org)--\(repo)"
   }
 
-  /// The `org/name` repo id from a HF download URL, e.g.
-  /// `https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/file.gguf`
-  /// → `"unsloth/Qwen3.5-2B-GGUF"`. Nil for URLs that don't match the HF
-  /// resolve shape.
-  static func repoId(from url: URL) -> String? {
-    let components = url.pathComponents
-    guard components.count >= 4, components[3] == "resolve" else { return nil }
-    return "\(components[1])/\(components[2])"
-  }
-
-  /// The repo-relative path a HF download URL points at (everything past
-  /// `resolve/{branch}/`), preserving subdir structure. e.g.
-  /// `https://huggingface.co/org/repo/resolve/main/Q4_K_M/model.gguf`
-  /// → `"Q4_K_M/model.gguf"`.
-  /// Returns nil for URLs that don't match the HF resolve shape.
-  static func repoRelativePath(from url: URL) -> String? {
-    // ["", org, repo, "resolve", branch, ...rest]
-    let components = url.pathComponents
-    guard components.count >= 6,
-      components[3] == "resolve"
-    else { return nil }
-    return components[5...].joined(separator: "/")
-  }
-
-  /// Directory that holds in-progress `.partial` files for a model.
-  /// Lives under the HF cache so promoting `.partial` → `blobs/<hash>` stays on the
-  /// same filesystem (moveItem is atomic).
+  /// Directory that holds a model's download placeholder.
   static func partialDir(cacheDir: URL, modelId: String) -> URL {
     cacheDir
       .appendingPathComponent(partialRootDirName)
       .appendingPathComponent(modelId)
-  }
-
-  /// Path to an in-progress `.partial` file for a single remote file.
-  static func partialPath(cacheDir: URL, modelId: String, filename: String) -> URL {
-    partialDir(cacheDir: cacheDir, modelId: modelId)
-      .appendingPathComponent("\(filename).partial")
   }
 
   /// Removes the model's partial directory (and any files under it).
@@ -98,39 +64,20 @@ enum HFCache {
     }
   }
 
-  /// Sum of `.partial` file sizes in a single model's staging dir.
-  /// Returns 0 if the dir doesn't exist or contains no `.partial` files.
-  ///
-  /// Walks recursively — some HF repos nest GGUFs in per-quant subdirs
-  /// (e.g. `Q4_K_M/model.gguf`), and the partial layout mirrors the repo
-  /// layout, so partials can live one level deep.
-  static func partialBytes(cacheDir: URL, modelId: String) -> Int64 {
-    let dir = partialDir(cacheDir: cacheDir, modelId: modelId)
-    let fm = FileManager.default
-    guard
-      let enumerator = fm.enumerator(
-        at: dir,
-        includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
-        options: [.skipsHiddenFiles]
-      )
-    else { return 0 }
-
-    var total: Int64 = 0
-    for case let url as URL in enumerator {
-      guard url.pathExtension == "partial" else { continue }
-      guard
-        let vals = try? url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
-        vals.isRegularFile == true
-      else { continue }
-      total += Int64(vals.fileSize ?? 0)
+  /// Sum of the sizes of llama-server's partial files in a repo: the
+  /// `blobs/<hash>.downloadInProgress` files it resumes from. Returns 0 if
+  /// there are none.
+  static func partialBytes(cacheDir: URL, repoDir: String) -> Int64 {
+    let blobsDir = cacheDir.appendingPathComponent(repoDir).appendingPathComponent("blobs")
+    let files = (try? FileManager.default.contentsOfDirectory(atPath: blobsDir.path)) ?? []
+    return files.filter { $0.hasSuffix(".downloadInProgress") }.reduce(0) {
+      $0 + FileManager.default.fileSize(atPath: blobsDir.appendingPathComponent($1).path)
     }
-    return total
   }
 
-  /// File name of the per-download placeholder dropped next to a model's
-  /// `.partial` files. Hidden (leading dot) and not a `.partial`, so
-  /// `partialBytes` ignores it; it rides inside the partial dir so the existing
-  /// `removePartials` cleanup disposes of it on completion/cancel.
+  /// File name of the per-download placeholder. Hidden (leading dot); it rides
+  /// inside the partial dir so `removePartials` disposes of it on
+  /// completion/cancel.
   static let placeholderFileName = ".model.json"
 
   /// Path to a download's placeholder file (the serialized `Model`). Written
@@ -174,249 +121,6 @@ enum HFCache {
 
     // Deleting the id dir can leave its org dir behind empty.
     cleanEmptyDirs(at: cacheDir.appendingPathComponent(partialRootDirName))
-  }
-
-  /// Returns true if `filename` (repo-relative) exists in any snapshot commit
-  /// of the repo — i.e. the file is already installed in the cache.
-  static func snapshotFileExists(cacheDir: URL, repoDir: String, filename: String) -> Bool {
-    let snapshotsDir =
-      cacheDir
-      .appendingPathComponent(repoDir)
-      .appendingPathComponent("snapshots")
-
-    guard let commits = try? FileManager.default.contentsOfDirectory(atPath: snapshotsDir.path)
-    else { return false }
-
-    return commits.contains { commit in
-      let filePath = snapshotsDir.appendingPathComponent(commit).appendingPathComponent(filename)
-      return FileManager.default.fileExists(atPath: filePath.path)
-    }
-  }
-
-  // MARK: - API Calls
-
-  /// Metadata returned by a HEAD request to a HF file URL.
-  struct FileMetadata {
-    /// Content hash (SHA256) from X-Linked-Etag or ETag header.
-    /// Nil if neither header contains a valid SHA256.
-    let blobHash: String?
-    /// Repo commit hash from the X-Repo-Commit header.
-    /// Nil if the header is missing.
-    let commitHash: String?
-  }
-
-  /// A download refused because the repo is gated and the request doesn't
-  /// have access. HF tags these with `X-Error-Code: GatedRepo`, and its status
-  /// tells the two cases apart: 401 when the request wasn't authenticated, 403
-  /// when it was but the account isn't on the repo's authorized list.
-  ///
-  /// Worth its own error because the generic "couldn't reach Hugging Face"
-  /// sends the user after the wrong fix -- waiting out a rate limit, or
-  /// signing in when they already are -- while the real one is requesting
-  /// access on the model's page.
-  struct GatedRepoError: LocalizedError {
-    /// `org/name`
-    let repo: String
-    let authenticated: Bool
-
-    var errorDescription: String? {
-      // "This model", not the repo id: the alert already names the model, and
-      // the id appears once anyway, in the page URL. The URL is in the text
-      // because the alert this ends up in has no link.
-      let page = "huggingface.co/\(repo)"
-      return authenticated
-        ? "Your Hugging Face account doesn’t have access to this model yet. Request access on its page, then try again once it’s granted:\n\(page)"
-        : "This model is gated. Sign in to Hugging Face in Settings > Advanced, then request access on its page:\n\(page)"
-    }
-  }
-
-  /// Fetches blob hash and commit hash for multiple files via HEAD requests.
-  ///
-  /// HF serves `X-Linked-Etag` (blob SHA256) and `X-Repo-Commit` (commit hash) in
-  /// the response to the resolve URL. We use a same-host redirect delegate to prevent
-  /// following redirects to the CDN, which would lose these headers.
-  ///
-  /// Uses a single URLSession for all requests (sessions are heavyweight).
-  ///
-  /// Throws `GatedRepoError` if HF refuses a file because the repo is gated;
-  /// any other failure just leaves that file out of the result.
-  static func fetchFileMetadata(
-    for urls: [URL], token: String?
-  ) async throws -> [URL: FileMetadata] {
-    let delegate = SameHostRedirectDelegate()
-    let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
-    defer { session.finishTasksAndInvalidate() }
-
-    var results: [URL: FileMetadata] = [:]
-
-    for url in urls {
-      var request = HFRequest.make(url, token: token)
-      request.httpMethod = "HEAD"
-
-      guard let (_, response) = try? await session.data(for: request),
-        let httpResponse = response as? HTTPURLResponse
-      else { continue }
-
-      // Every file of a repo shares its gate, so the first refusal settles it.
-      if httpResponse.value(forHTTPHeaderField: "X-Error-Code") == "GatedRepo",
-        let repo = repoId(from: url)
-      {
-        throw GatedRepoError(repo: repo, authenticated: httpResponse.statusCode == 403)
-      }
-
-      guard (200...399).contains(httpResponse.statusCode) else { continue }
-
-      // Extract blob hash from X-Linked-Etag (preferred) or ETag (fallback)
-      let blobHash: String? = {
-        if let etag = httpResponse.value(forHTTPHeaderField: "X-Linked-Etag") {
-          return etag.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-        }
-        if let etag = httpResponse.value(forHTTPHeaderField: "ETag") {
-          let cleaned =
-            etag
-            .replacingOccurrences(of: "W/", with: "")
-            .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-          // Only use if it looks like a SHA256 (64 hex chars)
-          if cleaned.count == 64, cleaned.allSatisfy({ $0.isHexDigit }) {
-            return cleaned
-          }
-        }
-        return nil
-      }()
-
-      let commitHash = httpResponse.value(forHTTPHeaderField: "X-Repo-Commit")
-      results[url] = FileMetadata(blobHash: blobHash, commitHash: commitHash)
-    }
-
-    return results
-  }
-
-  // MARK: - File Operations
-
-  /// Writes a downloaded file into the HF cache layout.
-  ///
-  /// 1. Moves temp file → blobs/{sha256}
-  /// 2. Links it into the snapshot (see `linkBlob`)
-  static func writeBlobAndLink(
-    cacheDir: URL,
-    repoDir: String,
-    commit: String,
-    blobHash: String,
-    filename: String,
-    from tempFile: URL
-  ) throws {
-    let fm = FileManager.default
-
-    let blobsDir = cacheDir.appendingPathComponent(repoDir).appendingPathComponent("blobs")
-    try fm.createDirectory(at: blobsDir, withIntermediateDirectories: true)
-
-    // Move temp file to blob (atomic within same filesystem).
-    // If blob already exists (identical content from concurrent download), just clean up temp.
-    let blobDest = blobsDir.appendingPathComponent(blobHash)
-    if fm.fileExists(atPath: blobDest.path) {
-      try? fm.removeItem(at: tempFile)
-    } else {
-      try fm.moveItem(at: tempFile, to: blobDest)
-    }
-
-    try linkBlob(
-      cacheDir: cacheDir, repoDir: repoDir, commit: commit, blobHash: blobHash, filename: filename)
-
-    logger.info("Wrote HF cache: \(repoDir)/blobs/\(blobHash) + snapshot symlink for \(filename)")
-  }
-
-  /// Links a blob that's already in the cache into `snapshots/{commit}/`
-  /// without downloading it again -- what `llama serve -hf` and
-  /// `huggingface_hub` do for a file an earlier download already brought in.
-  /// Returns false, linking nothing, when `blobs/{blobHash}` isn't on disk.
-  static func linkCachedBlob(
-    cacheDir: URL,
-    repoDir: String,
-    commit: String,
-    blobHash: String,
-    filename: String
-  ) throws -> Bool {
-    let blob =
-      cacheDir
-      .appendingPathComponent(repoDir)
-      .appendingPathComponent("blobs")
-      .appendingPathComponent(blobHash)
-    guard FileManager.default.fileExists(atPath: blob.path) else { return false }
-
-    try linkBlob(
-      cacheDir: cacheDir, repoDir: repoDir, commit: commit, blobHash: blobHash, filename: filename)
-
-    logger.info("Linked cached blob \(repoDir)/blobs/\(blobHash) into snapshot for \(filename)")
-    return true
-  }
-
-  /// 1. Creates symlink snapshots/{commit}/{filename} → ../../blobs/{sha256}
-  ///    (replacing whatever is there)
-  /// 2. Writes refs/main with the commit hash
-  private static func linkBlob(
-    cacheDir: URL,
-    repoDir: String,
-    commit: String,
-    blobHash: String,
-    filename: String
-  ) throws {
-    let fm = FileManager.default
-
-    let repoBase = cacheDir.appendingPathComponent(repoDir)
-    let snapshotDir = repoBase.appendingPathComponent("snapshots").appendingPathComponent(commit)
-    let refsDir = repoBase.appendingPathComponent("refs")
-
-    // Create directories
-    try fm.createDirectory(at: snapshotDir, withIntermediateDirectories: true)
-    try fm.createDirectory(at: refsDir, withIntermediateDirectories: true)
-
-    // Create symlink: snapshots/{commit}/{filename} → ../../blobs/{sha256}
-    // `filename` is repo-relative and may contain a subdir (e.g.
-    // `Q4_K_M/model.gguf`). In that case:
-    //   - the symlink's parent (`snapshots/{commit}/Q4_K_M/`) has to exist, and
-    //   - the relative target needs one extra `..` per extra path component
-    //     because we're one directory deeper than the flat case.
-    let symlinkPath = snapshotDir.appendingPathComponent(filename)
-    try fm.createDirectory(
-      at: symlinkPath.deletingLastPathComponent(),
-      withIntermediateDirectories: true)
-    if fm.fileExists(atPath: symlinkPath.path)
-      || (try? fm.destinationOfSymbolicLink(atPath: symlinkPath.path)) != nil
-    {
-      try? fm.removeItem(at: symlinkPath)
-    }
-    let depth = filename.split(separator: "/").count - 1  // 0 for flat, 1 for one subdir, etc.
-    let relativeTarget = String(repeating: "../", count: 2 + depth) + "blobs/\(blobHash)"
-    try fm.createSymbolicLink(atPath: symlinkPath.path, withDestinationPath: relativeTarget)
-
-    // Write refs/main with commit hash
-    let refsMainFile = refsDir.appendingPathComponent("main")
-    try commit.write(to: refsMainFile, atomically: true, encoding: .utf8)
-  }
-
-  /// Lowercase hex of a SHA256 digest -- the form HF names blobs by.
-  ///
-  /// The resumable download path hashes incrementally with CryptoKit's
-  /// `SHA256`: bytes are streamed into the hasher as they're written to the
-  /// `.partial` file (and any existing prefix is re-hashed once at resume time,
-  /// see `feedHasher`), so the digest is ready at completion without a second
-  /// full-file pass.
-  static func hex(_ digest: SHA256.Digest) -> String {
-    digest.map { String(format: "%02x", $0) }.joined()
-  }
-
-  /// Feeds the entire contents of `fileURL` into `hasher` in 1 MB chunks.
-  /// Used on resume to reconstruct the running hash over the existing `.partial` prefix.
-  static func feedHasher(_ hasher: inout SHA256, from fileURL: URL) throws {
-    let handle = try FileHandle(forReadingFrom: fileURL)
-    defer { try? handle.close() }
-    let chunkSize = 1_048_576  // 1 MB
-    while autoreleasepool(invoking: {
-      let data = handle.readData(ofLength: chunkSize)
-      guard !data.isEmpty else { return false }
-      hasher.update(data: data)
-      return true
-    }) {}
   }
 
   // MARK: - Deletion
@@ -791,27 +495,4 @@ enum HFCache {
       options: [.regularExpression, .caseInsensitive]) != nil
   }
 
-}
-
-// MARK: - Same-Host Redirect Delegate
-
-/// URLSession delegate that blocks cross-host redirects.
-/// HF redirects file URLs to a CDN for the actual download. The CDN response
-/// won't have HF-specific headers (X-Linked-Etag, X-Repo-Commit). By blocking
-/// the redirect, the HEAD request returns HF's 302 response with those headers intact.
-private class SameHostRedirectDelegate: NSObject, URLSessionTaskDelegate {
-  func urlSession(
-    _ session: URLSession,
-    task: URLSessionTask,
-    willPerformHTTPRedirection response: HTTPURLResponse,
-    newRequest request: URLRequest,
-    completionHandler: @escaping (URLRequest?) -> Void
-  ) {
-    // Allow same-host redirects (e.g., HTTP → HTTPS), block cross-host (HF → CDN)
-    if task.originalRequest?.url?.host == request.url?.host {
-      completionHandler(request)
-    } else {
-      completionHandler(nil)
-    }
-  }
 }

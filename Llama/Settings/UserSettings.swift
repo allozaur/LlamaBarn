@@ -497,10 +497,15 @@ enum UserSettings {
       defaults.string(forKey: Keys.hfToken)
     }
     set {
+      let old = hfToken
       if let newValue, !newValue.isEmpty, isValidHFToken(newValue) {
         defaults.set(newValue, forKey: Keys.hfToken)
       } else {
         defaults.removeObject(forKey: Keys.hfToken)
+      }
+      // The server is handed the token at launch, so a new one restarts it.
+      if hfToken != old {
+        NotificationCenter.default.post(name: .LBUserSettingsDidChange, object: nil)
       }
     }
   }

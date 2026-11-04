@@ -231,7 +231,7 @@ final class ModelItemView: ItemView, NSGestureRecognizerDelegate {
 
   @objc private func didClickCancel() {
     // Explicit discard — works for both active downloads and paused (interrupted) ones.
-    // In both cases we want the `.partial` staging dir gone and the row removed.
+    // In both cases we want the partial files gone and the row removed.
     actionHandler.cancelDownload(for: model)
   }
 
