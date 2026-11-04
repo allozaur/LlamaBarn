@@ -28,6 +28,51 @@ struct LlamaServerAPI {
     await post(endpoint: "models/unload", body: ["model": id])
   }
 
+  /// Asks the router to download a model into the HF cache (`POST /models`);
+  /// progress arrives on `modelEvents()`. Returns nil on success, else the
+  /// server's error message.
+  func downloadModel(id: String, sidecars: [String]) async -> String? {
+    guard let url = URL(string: "\(baseUrl)/models") else { return "Invalid server URL" }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try? JSONSerialization.data(
+      withJSONObject: ["model": id, "sidecars": sidecars])
+    do {
+      let (data, response) = try await Self.session.data(for: request)
+      if (response as? HTTPURLResponse)?.statusCode == 200 { return nil }
+      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+      return (json?["error"] as? [String: Any])?["message"] as? String
+        ?? "The server refused the download."
+    } catch {
+      return error.localizedDescription
+    }
+  }
+
+  /// Stops a download and drops its partial files (`DELETE /models?model=`).
+  func deleteDownload(id: String) async {
+    var components = URLComponents(string: "\(baseUrl)/models")
+    components?.queryItems = [URLQueryItem(name: "model", value: id)]
+    guard let url = components?.url else { return }
+    var request = URLRequest(url: url)
+    request.httpMethod = "DELETE"
+    _ = try? await Self.session.data(for: request)
+  }
+
+  /// Opens the router's model event stream (`GET /models/sse`): download
+  /// progress, completion and failure, among others.
+  func modelEvents() async throws -> URLSession.AsyncBytes {
+    guard let url = URL(string: "\(baseUrl)/models/sse") else { throw URLError(.badURL) }
+    var request = URLRequest(url: url)
+    // The stream idles between events; don't let that read as a timeout.
+    request.timeoutInterval = 60 * 60 * 24
+    let (bytes, response) = try await Self.session.bytes(for: request)
+    guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+      throw URLError(.badServerResponse)
+    }
+    return bytes
+  }
+
   /// Asks the router server to re-read models.ini and reconcile its model list
   /// in place (`GET /models?reload=1`). The server only unloads models whose
   /// entry was removed or changed -- untouched models stay resident.

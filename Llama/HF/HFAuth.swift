@@ -164,7 +164,14 @@ enum HFAuth {
     UserSettings.hfAccount = account
     // One credential at a time: the account replaces a pasted token, so
     // Settings never shows two and the user never wonders which one is used.
-    UserSettings.hfToken = nil
+    // The server is handed the token at launch, so restart it on this one --
+    // clearing a pasted token already does. Not on a refresh (`refresh`): that
+    // would drop the loaded model.
+    if UserSettings.hfToken != nil {
+      UserSettings.hfToken = nil
+    } else {
+      NotificationCenter.default.post(name: .LBUserSettingsDidChange, object: nil)
+    }
     logger.info("Signed in to Hugging Face as \(username, privacy: .public)")
     return account
   }
@@ -174,6 +181,7 @@ enum HFAuth {
   /// need an endpoint HF doesn't document.
   static func signOut() {
     UserSettings.hfAccount = nil
+    NotificationCenter.default.post(name: .LBUserSettingsDidChange, object: nil)
     logger.info("Signed out of Hugging Face")
   }
 

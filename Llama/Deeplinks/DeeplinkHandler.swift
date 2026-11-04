@@ -10,8 +10,8 @@ import os.log
 ///     showed a "Open in Llama?" prompt, so no extra confirmation here
 ///     either.
 ///   - No cross-launch persistence: if the app dies mid-download, the
-///     `.partial` bytes stay on disk. Re-clicking the same deeplink resolves
-///     to the same URLs and `openPartialWriter` resumes from those bytes.
+///     partial bytes stay on disk. Re-clicking the same deeplink resolves
+///     to the same model and the server resumes from those bytes.
 @MainActor
 final class DeeplinkHandler {
   static let shared = DeeplinkHandler()

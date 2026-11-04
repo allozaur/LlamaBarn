@@ -182,21 +182,6 @@ struct Model: Identifiable, Codable {
     scannedDraftHead ?? draftUrl.flatMap { DraftHead(sidecarPath: $0.lastPathComponent) }
   }
 
-  /// All remote URLs this model needs to download (main + shards + mmproj).
-  var allDownloadUrls: [URL] {
-    var urls = [downloadUrl]
-    if let additional = additionalParts {
-      urls.append(contentsOf: additional)
-    }
-    if let mmproj = mmprojUrl {
-      urls.append(mmproj)
-    }
-    if let draft = draftUrl {
-      urls.append(draft)
-    }
-    return urls
-  }
-
   /// HF cache repo directory name (e.g. "models--unsloth--Qwen3.5-2B-GGUF").
   /// Derived from `downloadUrl` for placeholder rows that came from a deeplink.
   /// Nil for scan-discovered entries (whose `downloadUrl` is `file:///`); those
